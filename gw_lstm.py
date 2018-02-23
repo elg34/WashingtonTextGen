@@ -77,11 +77,24 @@ def get_data(targetname,pretrains = None):
             pickle.dump(rawwords, fp)
 
     return rawwords
-    
-def batch_generator():
+
+def get_dicts(rawwords):
+        # get word counts and dictionaries and make a category for rare words
+        word_counts = Counter(word for word in rawwords)
+        words = [ word if word_counts[word]>5 else 'RARE' for word in rawwords ]
+        unique_words = sorted(list(set(words)))
+        word_to_int = dict((c, i) for i, c in enumerate(unique_words))
+        int_to_word = dict((i, c) for i, c in enumerate(unique_words))
+        n_words = len(words)
+        n_uwords = len(unique_words)
+        print('Total Words (without rare words): ', n_words)
+        print('Unique Words (without rare words): ', n_uwords)
+        return words,n_words,n_uwords,word_to_int,int_to_word
+
+def train_generator(shuffle_index,batches):
     count = 0
-    shuffle_index = np.arange(n_examples)
-    np.random.shuffle(shuffle_index)
+    #shuffle_index = np.arange(n_examples)
+    #np.random.shuffle(shuffle_index) 
     while 1:
         dataX = []
         dataY = []
@@ -96,32 +109,31 @@ def batch_generator():
         y = np_utils.to_categorical(dataY,num_classes=n_uwords) # one hot encoder
         count += 1 # move one batch forward and repeat
         yield(X,y)
-        if (count >= n_batches):
+        if (count >= batches):
                 np.random.shuffle(shuffle_index)
                 count=0
-
-def make_model(opt,loss):
-        # Keras model
-        nout = n_uwords
-        nin = seq_length
-        print('input size:',nin)
-        print('output size:',nout)
-        print('number of training exammples:',n_examples)
-        model = Sequential()
-        model.add(LSTM(64, input_shape=(nin,1), return_sequences=True, recurrent_dropout=0.1,dropout=0.5))
-        model.add(LSTM(64, input_shape=(nin,1), return_sequences=True, recurrent_dropout=0.1,dropout=0.5))
-        model.add(LSTM(64))
-        model.add(Dense(nout, activation='softmax'))
-        model.compile(loss=loss, optimizer=opt)
-        model.compile(optimizer=opt,loss=loss,metrics=['accuracy'])
-        return model
                 
-def fit_model(model,nb_epoch):                
-        # fit
-        #callb = [EarlyStopping(monitor='loss', min_delta=0, patience=0, verbose=0, mode='auto'), ModelCheckpoint('model.h5', monitor='loss', verbose=1, save_best_only=True)]
-        callb=[ModelCheckpoint('model.h5', monitor='loss', verbose=1, save_best_only=True)]
-        print('fitting...')
-        model.fit_generator(batch_generator(),n_batches, nb_epoch, verbose=1,callbacks=callb)
+def val_generator(shuffle_index,batches):
+    count = 0
+    #shuffle_index = np.arange(n_examples)
+    #np.random.shuffle(shuffle_index) 
+    while 1:
+        dataX = []
+        dataY = []
+        for i in shuffle_index[batch_size*count:batch_size*(count+1)]:
+            seq_in = words[i:i + seq_length] # seq_length number of words from all training words
+            seq_out = words[i + seq_length] # the word after that, training signal
+            dataX.append([word_to_int[word] for word in seq_in]) # seq of words turned into int value
+            dataY.append(word_to_int[seq_out]) # training signal word words turned into int value
+        X = np.asarray(dataX) # [individual samples, length of sequence]
+        X = np.reshape(X, (X.shape[0], X.shape[1], 1)) # [individual samples, length of sequence, features]
+        X = X / np.float32(n_uwords) # normalize
+        y = np_utils.to_categorical(dataY,num_classes=n_uwords) # one hot encoder
+        count += 1 # move one batch forward and repeat
+        yield(X,y)
+        if (count >= batches):
+                np.random.shuffle(shuffle_index)
+                count=0
 
 def load_data(name):
         with open (name, 'rb') as fp:
@@ -142,42 +154,81 @@ def predict_words(n_pred):
         index = np.random.multinomial(1, np.squeeze(prediction)) # sample over word probabilities to get actual prediction
         result = int_to_word[list(index).index(1)]
         seq_in = [int_to_word[value] for value in pattern]
-        #while result=='RARE': # if model predicts rare, sample again until it finds a more frequent word
-        #    index = np.random.multinomial(1, np.squeeze(prediction))
-        #    result = int_to_word[list(index).index(1)]
+        while result=='RARE' or result==pattern[-1]: # if model predicts rare, sample again until it finds a more frequent word
+            index = np.random.multinomial(1, np.squeeze(prediction))
+            result = int_to_word[list(index).index(1)]
         sys.stdout.write(result) # print result
         sys.stdout.write(" ")
         pattern.append(list(index).index(1))
         pattern = pattern[1:len(pattern)] # delete first element of pattern and continue (slowly gets rid of seed)
 
 
-# get raw text
-#raw_pretrain = get_data('gwtext.txt','pretrain/*.txt') # also makes file for main
-rawwords = load_data('text_main.pkl')
+def make_model(opt,loss):
+        # Keras model
+        nout = n_uwords
+        nin = seq_length
+        print('input size:',nin)
+        print('output size:',nout)
+        print('number of training exammples:',n_examples)
+        model = Sequential()
+        #model.add(LSTM(500, input_shape=(nin,1)))#, recurrent_dropout=0.1,dropout=0.5))
+        model.add(LSTM(300, input_shape=(nin,1), return_sequences=True, recurrent_dropout=0.1,dropout=0.5))
+        model.add(LSTM(300))
+        model.add(Dense(nout, activation='softmax'))
+        model.compile(optimizer=opt,loss=loss,metrics=['accuracy'])
+        return model
+                
+def fit_model(model,nb_epoch,val):                
+        print('fitting...')
+        if val:
+                callb=[ModelCheckpoint('model.h5', monitor='val_loss', verbose=1)]
+                inds = np.random.permutation(np.arange(n_examples))
+                train_ind = inds[:int(len(inds)*0.8)]
+                train_batches = len(train_ind)/batch_size
+                val_ind = inds[int(len(inds)*0.8)+1:]
+                val_batches = len(val_ind)/batch_size
+                model.fit_generator(train_generator(train_ind,train_batches),steps_per_epoch=train_batches,validation_data=val_generator(val_ind,val_batches), validation_steps=val_batches, epochs=nb_epoch, verbose=1,callbacks=callb)
+        else:
+                callb=[ModelCheckpoint('model.h5', monitor='loss', verbose=1, save_best_only=True)]
+                model.fit_generator(train_generator(np.random.permutation(np.arange(n_examples)),n_batches),n_batches, nb_epoch, verbose=1,callbacks=callb)
+                
 
-# get word counts and dictionaries and make a category for rare words
-word_counts = Counter(word for word in rawwords)
-words = [ word if word_counts[word]>5 else 'RARE' for word in rawwords ]
-unique_words = sorted(list(set(words)))
-word_to_int = dict((c, i) for i, c in enumerate(unique_words))
-int_to_word = dict((i, c) for i, c in enumerate(unique_words))
-n_words = len(words)
-n_uwords = len(unique_words)
-print('Total Words (without rare words): ', n_words)
-print('Unique Words (without rare words): ', n_uwords)
 
-batch_size = 64 # how many sequences to train concurrently per weight update
-seq_length = 25 # number of words per training sequence
+batch_size = 60 # how many sequences to train concurrently per weight update
+seq_length = 20 # number of words per training sequence
+
+######################
+#### PRETRAINING #####
+######################
+
+# get text & words
+raw_pretrain = get_data('gwtext.txt','pretrain/*.txt') # also makes file for main
+rawwords = load_data('text_pretrain.pkl')
+words,n_words,n_uwords,word_to_int,int_to_word = get_dicts(rawwords)
+
 n_examples = len(words)-seq_length # total number of available example sequences
 n_batches = n_examples/batch_size # how many batches from full set of examples
 
-# optimizer
-sgd = optimizers.SGD(lr=0.1, decay=1e-6, momentum=0.9, nesterov=True)
+rms = optimizers.RMSprop()#lr=0.001)
+#model = make_model(opt=rms,loss='categorical_crossentropy')
 
-model = make_model(opt=sgd,loss='categorical_crossentropy')
-#n_examples
-fit_model(model,nb_epoch=15)
+#fit_model(model,nb_epoch=2,val=False)
 
+######################
+### MAIN TRAINING ####
+######################
 
+# get text & words
+rawwords = load_data('text_main.pkl')
+words,_,_,_,_ = get_dicts(rawwords)
+model = load_model('model.h5')
 
+n_examples = len(words)-seq_length # total number of available example sequences
+n_batches = n_examples/batch_size # how many batches from full set of examples
+
+model.pop()
+model.add(Dense(n_uwords, activation='softmax'))
+model.compile(optimizer=rms,loss='categorical_crossentropy',metrics=['accuracy'])
+
+fit_model(model,nb_epoch=10,val=False)
 
